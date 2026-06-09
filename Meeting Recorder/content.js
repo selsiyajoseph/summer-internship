@@ -153,7 +153,7 @@
         let muteCheckInterval = null;
         let screenStreamRef = null;
         let hasAutoSaved = false;
-        
+        let isExtendingInProgress = false; 
         function showStatus(msg, isError = false, duration = 0) {
             if (statusDiv && !document.body.contains(statusDiv)) {
                 statusDiv = null;
@@ -296,30 +296,38 @@
                     'button[data-tooltip*="Move to a tab"]'
                 );
 
-        if (extendButton && isRecording && !hasAutoSaved) {
-            console.log("🚀 EXTEND BUTTON CLICKED - Moving to Meet tab");
-            
-            // Set flag to indicate we're extending (will force Meet recording)
-            chrome.storage.local.set({ 
-                isExtendingToMeet: true,
-                extendTransitionTime: Date.now(),
-                // forceMeetRecording: true  // NEW: Force Meet recording even if auto is OFF
-            });
-            
-            e.preventDefault();
-            e.stopPropagation();
-            
-            // ALWAYS save Huddle recording
-            forceSaveAndStop("Extending to Meet - saving Huddle recording").then(() => {
+                // Then replace the extend button detection inside setupExtendButtonDetection:
+if (extendButton && isRecording && !hasAutoSaved && !isExtendingInProgress) {
+    isExtendingInProgress = true;  // PREVENT duplicate extends
+    console.log("🚀 EXTEND BUTTON CLICKED - Moving to Meet tab");
+    
+    // Set flag for Meet tab to know this is an extension
+    chrome.storage.local.set({ 
+        isExtendingToMeet: true,
+        extendTransitionTime: Date.now(),
+    });
+    
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Save Huddle recording first
+    forceSaveAndStop("Extending to Meet - saving Huddle recording").then(() => {
+        setTimeout(() => {
+            try {
+                // Now open the Meet tab
+                extendButton.click();
+                // Reset the flag after 5 seconds (safety)
                 setTimeout(() => {
-                    try {
-                        extendButton.click();
-                    } catch(err) {
-                        console.log("Could not re-trigger extend click:", err);
-                    }
-                }, 500);
-            });
-        }
+                    isExtendingInProgress = false;
+                }, 5000);
+            } catch(err) {
+                console.log("Could not re-trigger extend click:", err);
+                isExtendingInProgress = false;
+            }
+        }, 500);
+    });
+}
+
             }, true);
             
             const extendObserver = new MutationObserver(() => {
