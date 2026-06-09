@@ -9,7 +9,26 @@
     let autoStartTimeout = null;
     let autoRecordPermissions = {};
     let pendingZoomRecordingTabs = new Set();
+    // Add these with the other variables at the top
+    let pendingRecorderCreation = false;  // Prevents duplicate recorder creation
+    let activeRecorderTabId = null;        // Tracks existing recorder tab
+    let isExtendingInProgress = false;     // Prevents duplicate extend processing
     
+
+    // Check if a recorder tab already exists
+async function getExistingRecorderTab() {
+    return new Promise((resolve) => {
+        chrome.tabs.query({ url: chrome.runtime.getURL("recorder.html") }, (tabs) => {
+            if (tabs && tabs.length > 0) {
+                // Filter out invalid tabs
+                const validTabs = tabs.filter(tab => tab.id && !tab.discarded);
+                resolve(validTabs.length > 0 ? validTabs[0] : null);
+            } else {
+                resolve(null);
+            }
+        });
+    });
+}
     // Service detection
     function detectService(url) {
         if (url.includes('meet.google.com')) return 'gmeet';
@@ -85,44 +104,72 @@
         if (changeInfo.status === "complete" && tab.url) {
             const service = detectService(tab.url);
                         
-            if (service === 'gmeet') {
-                // Check if this is an extend operation
-                chrome.storage.local.get(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording'], async (result) => {
-                    if (result.isExtendingToMeet) {
-                        console.log("🔄 EXTEND TRANSITION - Meet tab opened from Huddle");
-                        
-                        const transitionTime = result.extendTransitionTime || 0;
-                        const timeSinceExtend = Date.now() - transitionTime;
-                        
-                        if (timeSinceExtend < 10000) {
-                            console.log("✅ Valid extend transition - FORCE starting Meet recording");
-                            
-                            // Clear the flags
-                            chrome.storage.local.remove(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording']);
-                            
-                            // FORCE start recording regardless of auto-record setting
-                            console.log("🎬 FORCE starting Meet recording (auto-record setting ignored)");
-                            setTimeout(() => {
-                                startRecordingForTab(tabId, 'gmeet', true, true);
-                                // Wait a bit for recorder to start, then notify Meet tab
-                                setTimeout(() => {
-                                    chrome.tabs.sendMessage(tabId, { action: "recordingStarted" });
-                                }, 5000);
-                            }, 3000);
-                            
-                            // Also show a status message to the user
-                            chrome.tabs.sendMessage(tabId, { 
-                                action: "showMeetStatus", 
-                                message: "🎬 Auto-recording started (extended from Huddle)",
-                                duration: 5000
-                            });
-                        } else {
-                            console.log("⚠️ Extend flag expired - ignoring");
-                            chrome.storage.local.remove(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording']);
-                        }
-                    }
-                });
-            }            
+// REPLACE the gmeet section inside tabs.onUpdated with this:
+
+if (service === 'gmeet') {
+    // Use a flag to prevent duplicate processing
+    if (window._processingExtendForTab === tabId) {
+        console.log("⚠️ Already processing extend for this tab, skipping");
+        return;
+    }
+    
+    chrome.storage.local.get(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording'], async (result) => {
+        if (result.isExtendingToMeet) {
+            window._processingExtendForTab = tabId;
+            console.log("🔄 EXTEND TRANSITION - Meet tab opened from Huddle");
+            
+            const transitionTime = result.extendTransitionTime || 0;
+            const timeSinceExtend = Date.now() - transitionTime;
+            
+            if (timeSinceExtend < 10000) {
+                console.log("✅ Valid extend transition - FORCE starting Meet recording");
+                
+                // Clear the flags
+                chrome.storage.local.remove(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording']);
+                
+                // CHECK if recorder already exists BEFORE creating new one
+                const existingTabs = await chrome.tabs.query({ url: chrome.runtime.getURL("recorder.html") });
+                
+                if (existingTabs && existingTabs.length > 0) {
+                    console.log("✅ Recorder tab already exists, reusing for Meet extend");
+                    // Reuse existing recorder
+                    chrome.tabs.sendMessage(existingTabs[0].id, {
+                        action: "startRecording",
+                        tabId: tabId,
+                        autoRecord: true,
+                        service: 'gmeet',
+                        extended: true
+                    });
+                } else {
+                    console.log("🎬 Creating new recorder for Meet extend");
+                    // Wait then start recording
+                    setTimeout(() => {
+                        startRecordingForTab(tabId, 'gmeet', true, true);
+                    }, 3000);
+                }
+                
+                // Show status message
+                setTimeout(() => {
+                    chrome.tabs.sendMessage(tabId, { 
+                        action: "showMeetStatus", 
+                        message: "🎬 Auto-recording started (extended from Huddle)",
+                        duration: 5000
+                    });
+                }, 1000);
+            } else {
+                console.log("⚠️ Extend flag expired - ignoring");
+                chrome.storage.local.remove(['isExtendingToMeet', 'extendTransitionTime', 'forceMeetRecording']);
+            }
+            
+            // Reset processing flag after 10 seconds
+            setTimeout(() => {
+                if (window._processingExtendForTab === tabId) {
+                    window._processingExtendForTab = null;
+                }
+            }, 10000);
+        }
+    });
+}            
             
             if (service === 'gmeet') {
                 handleGmeetTabUpdate(tabId, tab);
@@ -449,69 +496,122 @@
         });
     }
 
-    // ==================== COMMON FUNCTIONS ====================
-    function startRecordingForTab(tabId, service, isAuto = false, extended = false) {
-        // ZOOM: prevent duplicate starts for the same tab
-        if (service === 'zoom') {
-            if (pendingZoomRecordingTabs.has(tabId)) {
-                console.log(`⚠️ Zoom tab ${tabId} already pending – skipping duplicate start`);
-                return;
-            }
-            pendingZoomRecordingTabs.add(tabId);
-            // Remove from set after 10 seconds (safety cleanup)
-            setTimeout(() => {
-                pendingZoomRecordingTabs.delete(tabId);
-            }, 10000);
-        }
-        if (currentRecordingTab && !isAuto) {
-            console.log("⚠️ Already recording in tab:", currentRecordingTab);
+// REPLACE the entire startRecordingForTab function with this:
+function startRecordingForTab(tabId, service, isAuto = false, extended = false) {
+    console.log(`🎬 startRecordingForTab called for ${service}, tab: ${tabId}`);
+    
+    // PREVENTION 1: Don't create if already creating one
+    if (pendingRecorderCreation) {
+        console.log("⚠️ Already creating a recorder tab, skipping duplicate request");
+        return;
+    }
+    
+    // PREVENTION 2: Check if recorder tab already exists
+    chrome.tabs.query({ url: chrome.runtime.getURL("recorder.html") }, (tabs) => {
+        if (tabs && tabs.length > 0) {
+            // Recorder tab exists! Reuse it instead of creating new one
+            console.log("✅ Recorder tab already exists, reusing it (ID: " + tabs[0].id + ")");
+            const existingTab = tabs[0];
+            
+            // Send start command to existing recorder
+            chrome.tabs.sendMessage(existingTab.id, { 
+                action: "startRecording", 
+                tabId: tabId,
+                autoRecord: isAuto,
+                service: service,
+                extended: extended
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.log("⚠️ Existing recorder not responding, creating new one");
+                    // Recorder not responding, close it and create new
+                    chrome.tabs.remove(existingTab.id, () => {
+                        createNewRecorderTab(tabId, service, isAuto, extended);
+                    });
+                } else {
+                    console.log("✅ Successfully reused existing recorder tab");
+                    currentRecordingTab = tabId;
+                    isAutoRecording = isAuto;
+                }
+            });
             return;
         }
-
-        console.log(`🎬 Starting recording for ${service} tab:`, tabId);
         
-        if (isAuto) {
-            isAutoRecording = true;
-        }
-        
-        chrome.tabs.create({
-            url: chrome.runtime.getURL("recorder.html"),
-            active: false
-        }, (recorderTab) => {
-            console.log("✅ Recorder tab opened:", recorderTab.id);
-            
-            const startRecording = (retryCount = 0) => {
-                console.log(`🔄 Attempting to start recording (attempt ${retryCount + 1})...`);
-                
-                chrome.tabs.sendMessage(recorderTab.id, { 
-                    action: "startRecording", 
-                    tabId: tabId,
-                    autoRecord: isAuto,
-                    service: service,
-                    extended: extended
-                }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        console.log(`❌ Recorder tab not ready (attempt ${retryCount + 1}/3), retrying...`);
-                        if (retryCount < 2) {
-                            setTimeout(() => startRecording(retryCount + 1), 1000);
-                        } else {
-                            console.error("❌ Failed to start recording after 3 attempts");
-                            chrome.tabs.remove(recorderTab.id);
+        // No recorder exists, create a new one
+        createNewRecorderTab(tabId, service, isAuto, extended);
+    });
+}
 
-                            if (service === 'gmeet' || service === 'teams' || service === 'zoom') {
-                                handlePermissionRecovery(tabId, service);
-                            }
-                        }
-                    } else {
-                        console.log("✅ Recording started successfully");
-                        currentRecordingTab = tabId;
-                    }
-                });
-            };
-            
-            setTimeout(() => startRecording(), 1500);
-        });
+// New helper function to create recorder tab
+function createNewRecorderTab(tabId, service, isAuto, extended) {
+    // Prevent multiple simultaneous creations
+    if (pendingRecorderCreation) {
+        console.log("⚠️ Already creating a recorder, skipping");
+        return;
     }
+    
+    pendingRecorderCreation = true;
+    console.log("🎬 Creating NEW recorder tab for", service);
+    
+    // Zoom-specific prevention
+    if (service === 'zoom') {
+        if (pendingZoomRecordingTabs.has(tabId)) {
+            console.log("⚠️ Zoom tab already pending, skipping");
+            pendingRecorderCreation = false;
+            return;
+        }
+        pendingZoomRecordingTabs.add(tabId);
+        setTimeout(() => {
+            pendingZoomRecordingTabs.delete(tabId);
+        }, 10000);
+    }
+    
+    // Create the recorder tab
+    chrome.tabs.create({
+        url: chrome.runtime.getURL("recorder.html"),
+        active: false
+    }, (recorderTab) => {
+        console.log("✅ New recorder tab created:", recorderTab.id);
+        activeRecorderTabId = recorderTab.id;
+        
+        // Try to start recording with retries
+        const startWithRetry = (retryCount = 0) => {
+            chrome.tabs.sendMessage(recorderTab.id, { 
+                action: "startRecording", 
+                tabId: tabId,
+                autoRecord: isAuto,
+                service: service,
+                extended: extended
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.log(`⚠️ Retry ${retryCount + 1}/3...`);
+                    if (retryCount < 2) {
+                        setTimeout(() => startWithRetry(retryCount + 1), 1000);
+                    } else {
+                        console.error("❌ Failed to start recording");
+                        chrome.tabs.remove(recorderTab.id);
+                        pendingRecorderCreation = false;
+                        activeRecorderTabId = null;
+                    }
+                } else {
+                    console.log("✅ Recording started successfully");
+                    currentRecordingTab = tabId;
+                    isAutoRecording = isAuto;
+                    pendingRecorderCreation = false;
+                }
+            });
+        };
+        
+        setTimeout(() => startWithRetry(), 1500);
+        
+        // Safety: Reset flag after 10 seconds if stuck
+        setTimeout(() => {
+            if (pendingRecorderCreation) {
+                console.log("⚠️ Safety timeout: resetting pendingRecorderCreation");
+                pendingRecorderCreation = false;
+            }
+        }, 10000);
+    });
+}
 
     function stopAllRecordings() {
         console.log("🛑 Stopping all recordings");
