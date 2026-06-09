@@ -17,29 +17,47 @@
     let currentTabId = null;
     let currentService = null;
     let isExtendedFromHuddle = false;
+    let isInitialized = false;
 
     let lastHeartbeat = Date.now();
     let heartbeatCheckInterval = null;
 
     console.log("🎬 Unified Recorder tab loaded");
+    // Add this function to handle reusing existing recorder
+async function reuseRecorderForNewTab(tabId, service, extended) {
+    console.log("🔄 Reusing existing recorder for new tab:", tabId);
+    
+    if (isRecording) {
+        // Already recording, just update the tab tracking
+        console.log("📝 Updating recorder to track new tab without restarting");
+        currentTabId = tabId;
+        currentService = service;
+        isExtendedFromHuddle = extended;
+        
+        // Update storage
+        chrome.storage.local.set({ recordingTabId: tabId });
+        
+        // Notify that we're still recording
+        chrome.runtime.sendMessage({ action: "recordingStarted" });
+        return true;
+    } else {
+        // Not recording, start normally
+        return startRecording(tabId);
+    }
+}
 
     // Service detection from URL parameters or message
-    function detectService() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const serviceFromUrl = urlParams.get('service');
+function detectService() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const serviceFromUrl = urlParams.get('service');
     
-        if (serviceFromUrl === 'gmeet' || serviceFromUrl === 'teams' || serviceFromUrl == 'zoom') {
-            return serviceFromUrl;
-        }
-    
-        // Fallback: check the currentService variable that might be set from messages
-        if (currentService === 'gmeet' || currentService === 'teams' || currentService === 'zoom') {
-            return currentService;
-        }
-    
-        console.log("⚠️ No service detected, defaulting to gmeet");
-        return 'gmeet'; // Default to gmeet
+    if (serviceFromUrl === 'gmeet' || serviceFromUrl === 'teams' || serviceFromUrl === 'zoom' || serviceFromUrl === 'gchat') {
+        return serviceFromUrl;
     }
+    
+    // Don't default to gmeet - return null and let message set it
+    return null;
+}
 
     function setupServiceBadge() {
         const badge = document.getElementById('serviceBadge');
@@ -993,15 +1011,25 @@
         const handleAsync = async () => {
             try {
                 if (message.action === "startRecording") {
-                    isAutoRecord = message.autoRecord || false;
-                    currentTabId = message.tabId;
-                    currentService = message.service || 'gmeet';
-                    isExtendedFromHuddle = message.extended === true;
-                    console.log("🎬 Starting recording, service:", currentService, "extended from huddle:", isExtendedFromHuddle);
-                    setupServiceBadge();
-                    await startRecording(message.tabId);
-                    return { success: true };
-                }
+    // Update service FIRST and set badge immediately
+    currentService = message.service || 'gmeet';
+    setupServiceBadge();  // ← ADD THIS LINE
+    
+    isAutoRecord = message.autoRecord || false;
+    currentTabId = message.tabId;
+    isExtendedFromHuddle = message.extended === true;
+    
+    // Check if we're already recording
+    if (isRecording && currentTabId !== message.tabId) {
+        chrome.storage.local.set({ recordingTabId: currentTabId });
+        sendResponse({ success: true, reused: true });
+        return true;
+    }
+    
+    await startRecording(message.tabId);
+    sendResponse({ success: true });
+    return true;
+}
                 else if (message.action === "recorderHeartbeat") {
                     resetHeartbeat();
                     return { success: true };
